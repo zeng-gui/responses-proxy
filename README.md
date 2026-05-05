@@ -26,6 +26,7 @@ Codex CLI              Proxy (FastAPI)              Upstream Providers
 - reasoning_content 自动注入（DeepSeek 兼容）
 - 启动时 provider 连通性预检
 - 请求体大小限制（10MB）、CORS、请求 ID
+- **Web 配置管理界面**（浏览器可视化配置 Provider，无需手动编辑 JSON）
 
 ## 环境要求
 
@@ -100,6 +101,17 @@ codex
 
 切换模型：修改 `config.toml` 中的 `model` 字段，重启 Codex。
 
+## Web 配置管理界面
+
+启动代理后，浏览器访问 **http://127.0.0.1:8000** 即可打开配置管理面板。
+
+功能：
+- 可视化管理 Provider（添加 / 删除 / 编辑）
+- API Key 掩码显示，点击即可修改
+- 模型列表标签化管理（回车添加、点击 × 删除）
+- 一键连通性测试（ping 上游 `/v1/models`）
+- 保存后自动热重载，无需重启进程
+
 ## providers.json 说明
 
 | 字段 | 说明 |
@@ -125,6 +137,11 @@ codex
 | POST | /v1/responses | Responses API 代理入口（按 model 自动路由） |
 | GET  | /v1/models | 返回所有已配置的模型列表 |
 | GET  | /health | 健康检查 |
+| GET  | / | Web 配置管理界面 |
+| GET  | /api/config | 获取当前配置 |
+| POST | /api/config | 保存配置并热重载 |
+| POST | /api/config/test | 测试 provider 连通性 |
+| POST | /api/reload | 热重载配置 |
 
 ## 关于 "Model metadata not found" 警告
 
@@ -142,7 +159,10 @@ supports_parallel_tool_calls = true
 ```
 .
 ├── config.py           # 配置加载 (providers.json + 环境变量)
+├── config_store.py     # 配置持久化 (providers.json 读写)
 ├── proxy.py            # 代理主逻辑 (FastAPI、协议转换、多 provider 路由)
+├── static/
+│   └── index.html      # Web 配置管理界面
 ├── providers.json      # provider 配置 (不提交 git，含密钥)
 ├── requirements.txt    # Python 依赖
 └── README.md           # 本文件

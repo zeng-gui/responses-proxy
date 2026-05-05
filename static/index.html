@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Responses Proxy - 配置管理</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--text2:#8b949e;--accent:#58a6ff;--accent2:#3fb950;--danger:#f85149;--danger-bg:#f8514922;--input-bg:#0d1117;--hover:#1f2937}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:20px}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:1.5rem;margin-bottom:4px}
+.subtitle{color:var(--text2);font-size:.85rem;margin-bottom:24px}
+
+/* Toast */
+#toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:.9rem;z-index:1000;opacity:0;transition:opacity .3s;pointer-events:none}
+#toast.show{opacity:1}
+#toast.success{background:#238636;color:#fff}
+#toast.error{background:#da3633;color:#fff}
+#toast.info{background:#1f6feb;color:#fff}
+
+/* Global settings bar */
+.global-bar{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.global-bar label{color:var(--text2);font-size:.8rem}
+.global-bar input,.global-bar select{background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:.85rem;width:160px}
+.global-bar input:focus,.global-bar select:focus{outline:none;border-color:var(--accent)}
+.global-bar select{cursor:pointer}
+.btn{padding:8px 16px;border:none;border-radius:6px;font-size:.85rem;cursor:pointer;font-weight:500;transition:all .15s}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:#79c0ff}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-danger:hover{background:#ff6e6a}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-outline:hover{border-color:var(--accent);color:var(--accent)}
+.btn-sm{padding:5px 12px;font-size:.8rem}
+.btn-test{background:#238636;color:#fff}
+.btn-test:hover{background:#2ea043}
+
+/* Stats bar */
+.stats{display:flex;gap:16px;margin-bottom:16px;font-size:.85rem;color:var(--text2)}
+.stats span{background:var(--card);padding:4px 12px;border-radius:6px;border:1px solid var(--border)}
+
+/* Provider cards */
+.card-list{display:flex;flex-direction:column;gap:12px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:20px;position:relative;transition:border-color .2s}
+.card:hover{border-color:#484f58}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.card-header h3{font-size:1rem;font-weight:600}
+.card-actions{display:flex;gap:8px}
+.form-row{display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.form-group{display:flex;flex-direction:column;gap:4px;flex:1;min-width:200px}
+.form-group label{font-size:.75rem;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+.form-group input{background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:.9rem;font-family:inherit}
+.form-group input:focus{outline:none;border-color:var(--accent)}
+.form-group input[type="password"]{font-family:monospace;letter-spacing:2px}
+
+/* Password toggle */
+.pwd-wrap{position:relative;display:flex;align-items:center}
+.pwd-wrap input{padding-right:36px;width:100%}
+.pwd-toggle{position:absolute;right:8px;background:none;border:none;color:var(--text2);cursor:pointer;font-size:1rem;padding:4px}
+.pwd-toggle:hover{color:var(--text)}
+
+/* Model tags */
+.model-tags{display:flex;flex-wrap:wrap;gap:6px;padding:6px;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;min-height:40px;align-items:center}
+.model-tags:focus-within{border-color:var(--accent)}
+.tag{background:#30363d;color:var(--text);padding:3px 8px;border-radius:4px;font-size:.8rem;display:flex;align-items:center;gap:4px}
+.tag .remove{cursor:pointer;color:var(--text2);font-weight:bold;font-size:.9rem;line-height:1}
+.tag .remove:hover{color:var(--danger)}
+.model-tags input{background:transparent;border:none;color:var(--text);font-size:.85rem;outline:none;min-width:100px;flex:1;padding:2px 4px}
+
+/* Test result */
+.test-result{font-size:.8rem;margin-top:6px;padding:4px 8px;border-radius:4px;display:none}
+.test-result.ok{display:block;background:#23863622;color:var(--accent2)}
+.test-result.fail{display:block;background:var(--danger-bg);color:var(--danger)}
+
+/* Add card button */
+.add-card{border:2px dashed var(--border);background:transparent;border-radius:10px;padding:20px;text-align:center;cursor:pointer;color:var(--text2);font-size:.9rem;transition:all .2s}
+.add-card:hover{border-color:var(--accent);color:var(--accent)}
+
+/* Config info */
+.config-info{margin-top:24px;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:10px;font-size:.8rem;color:var(--text2)}
+.config-info code{background:#0d1117;padding:2px 6px;border-radius:4px;color:var(--accent)}
+
+/* Confirm dialog */
+.overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:#000a;z-index:999;display:flex;align-items:center;justify-content:center}
+.dialog{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:380px;width:90%}
+.dialog h4{margin-bottom:12px}
+.dialog p{color:var(--text2);font-size:.9rem;margin-bottom:20px}
+.dialog-actions{display:flex;gap:8px;justify-content:flex-end}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Responses Proxy</h1>
+  <p class="subtitle">Chat Completions API 代理 — 配置管理面板</p>
+
+  <!-- Toast -->
+  <div id="toast"></div>
+
+  <!-- Global settings -->
+  <div class="global-bar">
+    <div>
+      <label>代理 Host</label><br>
+      <input id="g-host" value="127.0.0.1">
+    </div>
+    <div>
+      <label>代理端口</label><br>
+      <input id="g-port" type="number" value="8000">
+    </div>
+    <div>
+      <label>当前模型</label><br>
+      <select id="g-model"></select>
+    </div>
+    <div style="margin-left:auto;display:flex;gap:8px">
+      <button class="btn btn-outline" onclick="loadConfig()">刷新</button>
+      <button class="btn btn-primary" onclick="saveAll()">保存并重载</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats" id="stats"></div>
+
+  <!-- Provider cards -->
+  <div class="card-list" id="card-list"></div>
+  <div class="add-card" onclick="addProvider()">+ 添加 Provider</div>
+
+  <!-- Config info -->
+  <div class="config-info" id="config-info"></div>
+</div>
+
+<!-- Confirm dialog (hidden by default) -->
+<div class="overlay" id="confirm-overlay" style="display:none">
+  <div class="dialog">
+    <h4 id="confirm-title">确认</h4>
+    <p id="confirm-msg"></p>
+    <div class="dialog-actions">
+      <button class="btn btn-outline" onclick="closeConfirm()">取消</button>
+      <button class="btn btn-danger" id="confirm-ok" onclick="confirmAction()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──
+let providers = {};  // name -> {base_url, api_key, models}
+let rawKeys = {};    // name -> actual api_key (populated on save, not on load)
+let confirmCb = null;
+let configPath = '';
+let originalGlobal = {host: '127.0.0.1', port: 8000};
+
+// ── Toast ──
+function toast(msg, type='info') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = '', 3000);
+}
+
+// ── Confirm dialog ──
+function openConfirm(title, msg, cb) {
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-msg').textContent = msg;
+  document.getElementById('confirm-overlay').style.display = 'flex';
+  confirmCb = cb;
+}
+function closeConfirm() {
+  document.getElementById('confirm-overlay').style.display = 'none';
+  confirmCb = null;
+}
+function confirmAction() {
+  if (confirmCb) confirmCb();
+  closeConfirm();
+}
+
+// ── Load config ──
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const data = await r.json();
+    document.getElementById('g-host').value = data.global.host;
+    document.getElementById('g-port').value = data.global.port;
+    originalGlobal = {host: data.global.host, port: data.global.port};
+    configPath = data.config_path || '';
+
+    providers = {};
+    for (const [name, cfg] of Object.entries(data.providers || {})) {
+      providers[name] = {
+        base_url: cfg.base_url,
+        api_key: '',
+        api_key_masked: cfg.api_key_masked,
+        api_key_length: cfg.api_key_length,
+        models: cfg.models || [],
+      };
+      rawKeys[name] = null;
+    }
+
+    // 填充模型选择器
+    renderModelSelector(data.active_model || '');
+    renderStats(data.model_count);
+    renderCards();
+    renderInfo();
+    toast('配置已加载', 'success');
+  } catch(e) {
+    toast('加载失败: ' + e.message, 'error');
+  }
+}
+
+// ── Save all ──
+async function saveAll() {
+  const payload = {
+    global: {
+      host: document.getElementById('g-host').value.trim() || '127.0.0.1',
+      port: parseInt(document.getElementById('g-port').value) || 8000,
+    },
+    providers: {},
+  };
+  for (const [name, p] of Object.entries(providers)) {
+    const card = document.querySelector(`.card[data-name="${name}"]`);
+    if (!card) continue;
+
+    const base_url = card.querySelector('.f-url').value.trim();
+    const api_key_input = card.querySelector('.f-key');
+    const models = getModels(name);
+
+    if (!base_url) { toast(`Provider "${name}" 缺少 Base URL`, 'error'); return; }
+    if (!models.length) { toast(`Provider "${name}" 至少需要一个模型`, 'error'); return; }
+
+    const entry = {base_url, models};
+    // 只在用户实际修改了 key 时才发送 api_key 字段
+    if (api_key_input.dataset.modified === '1') {
+      entry.api_key = api_key_input.dataset.newkey || '';
+    }
+    payload.providers[name] = entry;
+  }
+
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      // 保存当前选择的模型到 config.toml
+      const activeModel = document.getElementById('g-model').value;
+      if (activeModel) {
+        try {
+          await fetch('/api/active-model', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({model: activeModel}),
+          });
+        } catch(_) {}
+      }
+
+      if (data.need_restart) {
+        const newHost = payload.global.host;
+        const newPort = payload.global.port;
+        toast('配置已保存，正在重启代理...', 'info');
+        try { await fetch('/api/restart', {method: 'POST'}); } catch(_) {}
+        setTimeout(() => {
+          window.location.href = `http://${newHost}:${newPort}`;
+        }, 2000);
+      } else {
+        toast(`已保存并重载，${data.model_count} 个模型`, 'success');
+        loadConfig();
+      }
+    } else {
+      toast('保存失败: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'error');
+  }
+}
+
+// ── Render stats ──
+function renderStats(modelCount) {
+  const el = document.getElementById('stats');
+  const pCount = Object.keys(providers).length;
+  el.innerHTML = `<span>Providers: ${pCount}</span><span>Models: ${modelCount}</span>`;
+}
+
+// ── Render model selector ──
+function renderModelSelector(activeModel) {
+  const sel = document.getElementById('g-model');
+  sel.innerHTML = '';
+  // 按 provider 分组
+  for (const [name, p] of Object.entries(providers)) {
+    if (!p.models.length) continue;
+    const group = document.createElement('optgroup');
+    group.label = name;
+    for (const m of p.models) {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === activeModel) opt.selected = true;
+      group.appendChild(opt);
+    }
+    sel.appendChild(group);
+  }
+}
+
+// ── Render cards ──
+function renderCards() {
+  const list = document.getElementById('card-list');
+  list.innerHTML = '';
+  for (const [name, p] of Object.entries(providers)) {
+    list.appendChild(createCard(name, p));
+  }
+}
+
+function createCard(name, p) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.dataset.name = name;
+
+  const keyDisplay = p.api_key_masked || '';
+  const keyLen = p.api_key_length || 0;
+
+  card.innerHTML = `
+    <div class="card-header">
+      <h3 contenteditable="true" class="card-title" spellcheck="false">${esc(name)}</h3>
+      <div class="card-actions">
+        <button class="btn btn-test btn-sm" onclick="testProvider(this)">连通性测试</button>
+        <button class="btn btn-danger btn-sm" onclick="removeProvider('${esc(name)}')">删除</button>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Base URL</label>
+        <input class="f-url" value="${esc(p.base_url)}" placeholder="https://api.example.com/v1">
+      </div>
+      <div class="form-group">
+        <label>API Key</label>
+        <div class="pwd-wrap">
+          <input class="f-key" type="password" value="${esc(keyDisplay)}" placeholder="输入 API Key"
+                 data-newkey="" data-modified="0" data-masklen="${keyLen}"
+                 onfocus="onKeyFocus(this)" oninput="onKeyInput(this)">
+          <button class="pwd-toggle" onclick="togglePwd(this)" title="显示/隐藏">&#128065;</button>
+        </div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-bottom:0">
+      <label>模型列表（回车添加，点击 × 删除）</label>
+      <div class="model-tags" data-provider="${esc(name)}">
+        ${p.models.map(m => `<span class="tag">${esc(m)}<span class="remove" onclick="removeModel(this,'${esc(m)}')">&times;</span></span>`).join('')}
+        <input placeholder="输入模型名称，回车添加" onkeydown="addModelKeydown(event, this)">
+      </div>
+    </div>
+    <div class="test-result"></div>
+  `;
+  return card;
+}
+
+// ── Model tags ──
+function getModels(name) {
+  const container = document.querySelector(`.model-tags[data-provider="${name}"]`);
+  if (!container) return [];
+  return [...container.querySelectorAll('.tag')].map(t => t.childNodes[0].textContent.trim());
+}
+
+function addModelKeydown(e, input) {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const val = input.value.trim();
+  if (!val) return;
+  const container = input.parentElement;
+  const providerName = container.dataset.provider;
+  // Check duplicate
+  const existing = [...container.querySelectorAll('.tag')].map(t => t.childNodes[0].textContent.trim());
+  if (existing.includes(val)) { toast('模型名已存在', 'error'); return; }
+  const tag = document.createElement('span');
+  tag.className = 'tag';
+  tag.innerHTML = `${esc(val)}<span class="remove" onclick="removeModel(this,'${esc(val)}')">&times;</span>`;
+  container.insertBefore(tag, input);
+  input.value = '';
+}
+
+function removeModel(el, name) {
+  el.parentElement.remove();
+}
+
+// ── Add / Remove provider ──
+function addProvider() {
+  let baseName = 'new-provider';
+  let i = 1;
+  while (providers[baseName]) { baseName = 'new-provider-' + i++; }
+  providers[baseName] = {base_url: '', api_key: '', api_key_masked: '', api_key_length: 0, models: []};
+  rawKeys[baseName] = '';
+  renderCards();
+  // Focus the title for renaming
+  setTimeout(() => {
+    const title = document.querySelector(`.card[data-name="${baseName}"] .card-title`);
+    if (title) { title.focus(); selectAll(title); }
+  }, 50);
+}
+
+function removeProvider(name) {
+  openConfirm('删除 Provider', `确定要删除 "${name}" 吗？`, () => {
+    delete providers[name];
+    delete rawKeys[name];
+    renderCards();
+    toast(`已删除 ${name}`, 'info');
+  });
+}
+
+// ── Title rename ──
+document.addEventListener('input', (e) => {
+  if (!e.target.classList.contains('card-title')) return;
+  const card = e.target.closest('.card');
+  const oldName = card.dataset.name;
+  const newName = e.target.textContent.trim();
+  if (!newName || newName === oldName) return;
+  // Update providers map
+  providers[newName] = providers[oldName];
+  delete providers[oldName];
+  rawKeys[newName] = rawKeys[oldName];
+  delete rawKeys[oldName];
+  card.dataset.name = newName;
+  // Update model tags provider reference
+  const tags = card.querySelector('.model-tags');
+  if (tags) tags.dataset.provider = newName;
+});
+
+// ── Password field ──
+function onKeyFocus(input) {
+  if (input.dataset.newkey) return;
+  // If showing masked value, clear on focus for editing
+  const masked = input.value;
+  const origLen = parseInt(input.dataset.masklen || '0');
+  if (origLen > 0 && masked.includes('•')) {
+    input.value = '';
+    input.dataset.newkey = '';
+  }
+}
+
+function onKeyInput(input) {
+  input.dataset.newkey = input.value;
+  input.dataset.modified = '1';
+}
+
+function togglePwd(btn) {
+  const input = btn.previousElementSibling;
+  if (input.type === 'password') {
+    input.type = 'text';
+  } else {
+    input.type = 'password';
+  }
+}
+
+// ── Connectivity test ──
+async function testProvider(btn) {
+  const card = btn.closest('.card');
+  const base_url = card.querySelector('.f-url').value.trim();
+  const keyInput = card.querySelector('.f-key');
+  const api_key = keyInput.dataset.newkey || '';
+  const resultEl = card.querySelector('.test-result');
+
+  if (!base_url) { toast('请先填写 Base URL', 'error'); return; }
+
+  btn.disabled = true;
+  btn.textContent = '测试中...';
+  resultEl.className = 'test-result';
+  resultEl.style.display = 'none';
+
+  try {
+    const r = await fetch('/api/config/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({base_url, api_key}),
+    });
+    const data = await r.json();
+    if (data.status === 'ok') {
+      resultEl.className = 'test-result ok';
+      resultEl.textContent = `✓ 连接成功 (${data.message})`;
+    } else {
+      resultEl.className = 'test-result fail';
+      resultEl.textContent = `✗ 连接失败: ${data.message}`;
+    }
+  } catch(e) {
+    resultEl.className = 'test-result fail';
+    resultEl.textContent = `✗ 请求失败: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '连通性测试';
+  }
+}
+
+// ── Config info ──
+function renderInfo() {
+  const el = document.getElementById('config-info');
+  el.innerHTML = `配置文件: <code>${esc(configPath)}</code> &nbsp;|&nbsp; Provider 配置修改后即时生效 &nbsp;|&nbsp; Host/Port 修改后自动重启代理`;
+}
+
+// ── Helpers ──
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function selectAll(el) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+// ── Init ──
+loadConfig();
+</script>
+</body>
+</html>

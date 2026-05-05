@@ -7,6 +7,7 @@ Preserves full tool call lifecycle, streaming, reasoning content, and conversati
 
 import hmac
 import json
+import os
 import time
 import uuid
 import logging
@@ -16,7 +17,9 @@ import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 # ── orjson acceleration (fallback to stdlib json) ─────────────────────────────
 try:
@@ -32,7 +35,8 @@ except ImportError:
     def _loads(s: str) -> Any:
         return json.loads(s)
 
-from config import PROVIDERS, PROXY_HOST, PROXY_PORT, PROXY_AUTH_TOKEN, ProviderConfig
+from config import PROVIDERS, PROXY_HOST, PROXY_PORT, PROXY_AUTH_TOKEN, ProviderConfig, reload_providers
+import config_store
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -73,6 +77,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 
@@ -616,6 +624,191 @@ def to_responses_format(chat_response: dict, model: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  CONFIG MANAGEMENT API
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+async def index():
+    """返回 Web UI 管理页面。"""
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file), media_type="text/html")
+    return HTMLResponse("<h1>Responses→ChatCompletions Proxy</h1><p>static/index.html 不存在</p>")
+
+
+@app.get("/api/config")
+async def get_config():
+    """返回当前配置（providers + 全局设置）。"""
+    raw = config_store.read_raw_config()
+    # 掩码处理 API Key：只显示前 4 位和后 4 位
+    providers = raw.get("providers", {})
+    masked = {}
+    for name, cfg in providers.items():
+        key = cfg.get("api_key", "")
+        if len(key) > 8:
+            masked_key = key[:4] + "•" * (len(key) - 8) + key[-4:]
+        elif key:
+            masked_key = key[:2] + "•" * (len(key) - 2)
+        else:
+            masked_key = ""
+        masked[name] = {
+            "base_url": cfg.get("base_url", ""),
+            "api_key_masked": masked_key,
+            "api_key_length": len(key),
+            "models": cfg.get("models", []),
+        }
+    # 读取 global 配置（providers.json 中的值优先，否则用环境变量）
+    g = raw.get("global", {})
+    return {
+        "global": {
+            "host": g.get("host", PROXY_HOST),
+            "port": g.get("port", PROXY_PORT),
+        },
+        "active_model": config_store.read_codex_model(),
+        "providers": masked,
+        "model_count": len(PROVIDERS),
+        "config_path": config_store.get_config_path(),
+    }
+
+
+@app.post("/api/config")
+async def save_config(request: Request):
+    """保存配置到 providers.json 并热重载。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    providers = body.get("providers")
+    if not isinstance(providers, dict):
+        return JSONResponse(status_code=400, content={"error": "Missing or invalid 'providers' field"})
+
+    # 读取当前配置，用于保留未修改的 api_key
+    current_raw = config_store.read_raw_config()
+    current_providers = current_raw.get("providers", {})
+
+    # 校验每个 provider 并保留未修改的 api_key
+    for name, cfg in providers.items():
+        if not isinstance(cfg, dict):
+            return JSONResponse(status_code=400, content={"error": f"Provider '{name}' must be an object"})
+        if not cfg.get("base_url"):
+            return JSONResponse(status_code=400, content={"error": f"Provider '{name}' missing base_url"})
+        if not cfg.get("models") or not isinstance(cfg["models"], list):
+            return JSONResponse(status_code=400, content={"error": f"Provider '{name}' missing models list"})
+        # 未传 api_key 或为空时，保留原有值
+        if not cfg.get("api_key"):
+            if name in current_providers and current_providers[name].get("api_key"):
+                cfg["api_key"] = current_providers[name]["api_key"]
+
+    # 处理 global 配置（host/port），检测是否有变化
+    global_cfg = body.get("global")
+    need_restart = False
+    if global_cfg:
+        old_host = current_raw.get("global", {}).get("host", PROXY_HOST)
+        old_port = current_raw.get("global", {}).get("port", PROXY_PORT)
+        new_host = global_cfg.get("host", old_host)
+        new_port = global_cfg.get("port", old_port)
+        if str(old_host) != str(new_host) or str(old_port) != str(new_port):
+            need_restart = True
+            # 同步更新 config.toml 的 base_url
+            config_store.write_codex_base_url(new_host, new_port)
+
+    try:
+        config_store.save_providers(providers, global_cfg)
+        model_count = reload_providers()
+        return {"status": "ok", "model_count": model_count, "need_restart": need_restart}
+    except Exception as e:
+        log.error("保存配置失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": f"Failed to save: {e}"})
+
+
+@app.post("/api/config/test")
+async def test_provider(request: Request):
+    """测试单个 provider 的连通性。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    base_url = body.get("base_url", "").rstrip("/")
+    api_key = body.get("api_key", "")
+
+    if not base_url:
+        return JSONResponse(status_code=400, content={"error": "Missing base_url"})
+
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        r = await _http_client.get(f"{base_url}/models", headers=headers, timeout=10)
+        return {
+            "status": "ok" if r.status_code == 200 else "error",
+            "status_code": r.status_code,
+            "message": f"HTTP {r.status_code}",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/api/reload")
+async def reload_config():
+    """热重载配置（不重启进程）。"""
+    try:
+        model_count = reload_providers()
+        return {"status": "ok", "model_count": model_count}
+    except Exception as e:
+        log.error("重载配置失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": f"Reload failed: {e}"})
+
+
+@app.post("/api/restart")
+async def restart_server():
+    """重启代理服务器（用于 host/port 变更后）。"""
+    import sys
+    import threading
+
+    def do_restart():
+        import time
+        time.sleep(0.5)
+        log.info("正在重启代理...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    threading.Thread(target=do_restart, daemon=True).start()
+    return {"status": "restarting"}
+
+
+@app.get("/api/active-model")
+async def get_active_model():
+    """返回当前 Codex CLI 激活的模型。"""
+    return {"model": config_store.read_codex_model()}
+
+
+@app.post("/api/active-model")
+async def set_active_model(request: Request):
+    """设置 Codex CLI 激活的模型（自动更新 config.toml）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    model = body.get("model", "").strip()
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "Missing model"})
+
+    # 校验模型是否在已配置的列表中
+    if model not in PROVIDERS:
+        available = ", ".join(sorted(PROVIDERS.keys()))
+        return JSONResponse(status_code=400, content={
+            "error": f"Unknown model '{model}'. Available: {available}"
+        })
+
+    try:
+        config_store.write_codex_model(model)
+        return {"status": "ok", "model": model}
+    except Exception as e:
+        log.error("更新 config.toml 失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": f"Failed to update config.toml: {e}"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -728,6 +921,17 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Starting proxy server on http://{PROXY_HOST}:{PROXY_PORT}")
+    import webbrowser
+    import threading
+
+    url = f"http://{PROXY_HOST}:{PROXY_PORT}"
+    print(f"Starting proxy server on {url}")
     print(f"Models: {', '.join(sorted(PROVIDERS.keys()))}")
+
+    def _open_browser():
+        import time
+        time.sleep(1.5)
+        webbrowser.open(url)
+
+    threading.Thread(target=_open_browser, daemon=True).start()
     uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT)
