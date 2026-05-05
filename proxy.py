@@ -665,6 +665,7 @@ async def get_config():
             "port": g.get("port", PROXY_PORT),
         },
         "active_model": config_store.read_codex_model(),
+        "codex_config_paths": raw.get("codex_config_paths", ["~/.codex/config.toml"]),
         "providers": masked,
         "model_count": len(PROVIDERS),
         "config_path": config_store.get_config_path(),
@@ -710,11 +711,12 @@ async def save_config(request: Request):
         new_port = global_cfg.get("port", old_port)
         if str(old_host) != str(new_host) or str(old_port) != str(new_port):
             need_restart = True
-            # 同步更新 config.toml 的 base_url
-            config_store.write_codex_base_url(new_host, new_port)
+        # 每次保存都同步更新 config.toml 的 base_url
+        config_store.write_codex_base_url(new_host, new_port)
 
     try:
-        config_store.save_providers(providers, global_cfg)
+        config_store.save_providers(providers, global_cfg,
+                                    body.get("codex_config_paths"))
         model_count = reload_providers()
         return {"status": "ok", "model_count": model_count, "need_restart": need_restart}
     except Exception as e:
@@ -732,6 +734,12 @@ async def test_provider(request: Request):
 
     base_url = body.get("base_url", "").rstrip("/")
     api_key = body.get("api_key", "")
+    provider_name = body.get("provider_name", "")
+
+    # 如果没有提供 api_key，尝试从已保存的配置中获取
+    if not api_key and provider_name:
+        saved = config_store.read_raw_config().get("providers", {}).get(provider_name, {})
+        api_key = saved.get("api_key", "")
 
     if not base_url:
         return JSONResponse(status_code=400, content={"error": "Missing base_url"})
@@ -739,11 +747,17 @@ async def test_provider(request: Request):
     try:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         r = await _http_client.get(f"{base_url}/models", headers=headers, timeout=10)
-        return {
-            "status": "ok" if r.status_code == 200 else "error",
-            "status_code": r.status_code,
-            "message": f"HTTP {r.status_code}",
-        }
+        if r.status_code == 200:
+            return {"status": "ok", "status_code": 200, "message": "连接成功"}
+        elif r.status_code in (401, 403):
+            return {"status": "error", "status_code": r.status_code, "message": "认证失败，请检查 API Key"}
+        elif r.status_code == 404:
+            # 服务器可达但不支持 /models 端点，不算失败
+            return {"status": "ok", "status_code": 404, "message": "连接成功（服务器不支持 /models 查询）"}
+        else:
+            return {"status": "error", "status_code": r.status_code, "message": f"HTTP {r.status_code}"}
+    except httpx.TimeoutException:
+        return {"status": "error", "message": "连接超时"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -763,16 +777,26 @@ async def reload_config():
 async def restart_server():
     """重启代理服务器（用于 host/port 变更后）。"""
     import sys
+    import subprocess
     import threading
 
     def do_restart():
         import time
-        time.sleep(0.5)
+        time.sleep(1.0)  # 等待响应发送完成
         log.info("正在重启代理...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        
+        # 启动新进程
+        proc = subprocess.Popen(
+            [sys.executable] + sys.argv,
+            cwd=os.getcwd(),
+        )
+        # 等待新进程启动
+        time.sleep(2.0)
+        # 退出当前进程
+        os._exit(0)
 
     threading.Thread(target=do_restart, daemon=True).start()
-    return {"status": "restarting"}
+    return {"status": "restarting", "message": "代理将在 1 秒后重启"}
 
 
 @app.get("/api/active-model")

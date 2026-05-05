@@ -81,6 +81,13 @@ h1{font-size:1.5rem;margin-bottom:4px}
 .config-info{margin-top:24px;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:10px;font-size:.8rem;color:var(--text2)}
 .config-info code{background:#0d1117;padding:2px 6px;border-radius:4px;color:var(--accent)}
 
+/* Config paths section */
+.config-paths{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px 20px;margin-bottom:20px}
+.config-paths h4{font-size:.85rem;margin-bottom:10px;color:var(--text2)}
+.config-path-item{display:flex;gap:8px;margin-bottom:6px;align-items:center}
+.config-path-item input{flex:1;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:.85rem;font-family:monospace}
+.config-path-item input:focus{outline:none;border-color:var(--accent)}
+
 /* Confirm dialog */
 .overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:#000a;z-index:999;display:flex;align-items:center;justify-content:center}
 .dialog{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:380px;width:90%}
@@ -91,8 +98,8 @@ h1{font-size:1.5rem;margin-bottom:4px}
 </head>
 <body>
 <div class="container">
-  <h1>Responses Proxy</h1>
-  <p class="subtitle">Chat Completions API 代理 — 配置管理面板</p>
+  <h1>Responses → ChatCompletions Proxy</h1>
+  <p class="subtitle">Codex CLI 协议转换代理 — 配置管理面板</p>
 
   <!-- Toast -->
   <div id="toast"></div>
@@ -119,6 +126,13 @@ h1{font-size:1.5rem;margin-bottom:4px}
 
   <!-- Stats -->
   <div class="stats" id="stats"></div>
+
+  <!-- Codex config paths -->
+  <div class="config-paths">
+    <h4>Codex 配置文件路径（保存时自动更新 model 和 base_url）</h4>
+    <div id="config-paths-list"></div>
+    <button class="btn btn-outline btn-sm" onclick="addConfigPath()" style="margin-top:8px">+ 添加路径</button>
+  </div>
 
   <!-- Provider cards -->
   <div class="card-list" id="card-list"></div>
@@ -147,6 +161,7 @@ let rawKeys = {};    // name -> actual api_key (populated on save, not on load)
 let confirmCb = null;
 let configPath = '';
 let originalGlobal = {host: '127.0.0.1', port: 8000};
+let codexConfigPaths = [];  // codex config.toml 路径列表
 
 // ── Toast ──
 function toast(msg, type='info') {
@@ -196,6 +211,8 @@ async function loadConfig() {
     }
 
     // 填充模型选择器
+    codexConfigPaths = data.codex_config_paths || ['~/.codex/config.toml'];
+    renderConfigPaths();
     renderModelSelector(data.active_model || '');
     renderStats(data.model_count);
     renderCards();
@@ -213,6 +230,7 @@ async function saveAll() {
       host: document.getElementById('g-host').value.trim() || '127.0.0.1',
       port: parseInt(document.getElementById('g-port').value) || 8000,
     },
+    codex_config_paths: codexConfigPaths,
     providers: {},
   };
   for (const [name, p] of Object.entries(providers)) {
@@ -381,6 +399,31 @@ function removeModel(el, name) {
   el.parentElement.remove();
 }
 
+// ── Config paths ──
+function renderConfigPaths() {
+  const el = document.getElementById('config-paths-list');
+  el.innerHTML = codexConfigPaths.map((p, i) => `
+    <div class="config-path-item">
+      <input value="${esc(p)}" onchange="updateConfigPath(${i}, this.value)">
+      <button class="btn btn-danger btn-sm" onclick="removeConfigPath(${i})" style="padding:5px 10px">&times;</button>
+    </div>
+  `).join('');
+}
+
+function addConfigPath() {
+  codexConfigPaths.push('~/.codex/config.toml');
+  renderConfigPaths();
+}
+
+function removeConfigPath(i) {
+  codexConfigPaths.splice(i, 1);
+  renderConfigPaths();
+}
+
+function updateConfigPath(i, val) {
+  codexConfigPaths[i] = val;
+}
+
 // ── Add / Remove provider ──
 function addProvider() {
   let baseName = 'new-provider';
@@ -452,6 +495,7 @@ function togglePwd(btn) {
 // ── Connectivity test ──
 async function testProvider(btn) {
   const card = btn.closest('.card');
+  const providerName = card.dataset.name;
   const base_url = card.querySelector('.f-url').value.trim();
   const keyInput = card.querySelector('.f-key');
   const api_key = keyInput.dataset.newkey || '';
@@ -461,14 +505,14 @@ async function testProvider(btn) {
 
   btn.disabled = true;
   btn.textContent = '测试中...';
+  resultEl.style.display = '';
   resultEl.className = 'test-result';
-  resultEl.style.display = 'none';
 
   try {
     const r = await fetch('/api/config/test', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({base_url, api_key}),
+      body: JSON.stringify({base_url, api_key, provider_name: providerName}),
     });
     const data = await r.json();
     if (data.status === 'ok') {
