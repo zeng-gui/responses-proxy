@@ -1,58 +1,109 @@
-﻿# Responses-to-ChatCompletions Proxy
+# Responses-to-ChatCompletions Proxy
 
-将 OpenAI Responses API 转换为 Chat Completions API 的轻量代理服务，使 Codex CLI 等工具能够对接 MiMo 等仅支持 Chat Completions 的后端。
+将 OpenAI Responses API 转换为 Chat Completions API 的轻量代理服务，支持多 provider 路由，使 Codex CLI 等工具能够对接 MiMo、DeepSeek、Qwen 等后端。
 
 ## 工作原理
 
-`
-Codex CLI              Proxy (FastAPI)              MiMo / Upstream
-    |                       |                             |
-    |-- Responses API ----->|                             |
-    |                       |-- Chat Completions API ---->|
-    |                       |<--- Chat Completions resp --|
-    |<-- Responses API -----|                             |
-`
+```
+Codex CLI              Proxy (FastAPI)              Upstream Providers
+    |                       |                              |
+    |-- Responses API ----->|                              |
+    |                       |-- model="mimo-v2.5-pro" ---->| MiMo API
+    |                       |-- model="deepseek-chat" ---->| DeepSeek API
+    |                       |-- model="qwen3.6-plus" ----->| Qwen API
+    |                       |<--- Chat Completions resp ---|
+    |<-- Responses API -----|                              |
+```
 
-代理在两个 API 格式之间进行双向转换，保留:
-
-- 流式 (SSE) 与非流式响应
-- 工具调用 (function_call) 完整生命周期
-- 推理内容 (reasoning_content)
-- 会话历史与系统指令
+代理根据请求中的 `model` 字段自动路由到对应的上游 provider。
 
 ## 环境要求
 
 - Python 3.10+
+- Codex CLI
 
 ## 快速开始
 
-`ash
-# 1. 安装依赖
+### 1. 安装依赖
+
+```bash
 pip install -r requirements.txt
+```
 
-# 2. 配置环境变量
-export MIMO_API_KEY="your-api-key-here"
-export MIMO_BASE_URL="https://your-upstream/v1"  # 可选
-export PROXY_HOST="127.0.0.1"                     # 可选
-export PROXY_PORT="8000"                          # 可选
-export PROXY_AUTH_TOKEN="your-proxy-token"         # 可选，启用代理鉴权
+### 2. 配置 providers.json
 
-# 3. 启动服务
+```json
+{
+  "providers": {
+    "mimo": {
+      "base_url": "https://your-mimo-api/v1",
+      "api_key": "your-mimo-key",
+      "models": ["mimo-v2.5-pro", "mimo-v2.5"]
+    },
+    "deepseek": {
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "your-deepseek-key",
+      "models": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    "qwen": {
+      "base_url": "https://your-qwen-api/v1",
+      "api_key": "your-qwen-key",
+      "models": ["qwen3.6-plus", "qwen-max"]
+    }
+  }
+}
+```
+
+### 3. 配置 Codex CLI
+
+编辑 `~/.codex/config.toml`（Windows: `%USERPROFILE%\.codex\config.toml`）：
+
+```toml
+model = "mimo-v2.5-pro"
+
+[model_providers.proxy]
+name = "proxy"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+编辑 `~/.codex/auth.json`（可留空，代理从 providers.json 读取密钥）：
+
+```json
+{
+  "OPENAI_API_KEY": ""
+}
+```
+
+### 4. 启动代理
+
+```bash
 python proxy.py
-`
+```
 
-或使用 uvicorn:
+### 5. 使用 Codex
 
-`ash
-uvicorn proxy:app --host 127.0.0.1 --port 8000
-`
+```bash
+codex
+```
 
-## 环境变量
+切换模型：修改 `config.toml` 中的 `model` 字段，重启 Codex。
+
+## providers.json 说明
+
+| 字段 | 说明 |
+|------|------|
+| `base_url` | 上游 API 地址（必须） |
+| `api_key` | 上游 API 密钥（可选，缺省从 ~/.codex/auth.json 读取） |
+| `models` | 该 provider 支持的模型列表（必须） |
+
+`api_key` 优先级：providers.json 中的值 > 环境变量 `MIMO_API_KEY` > `~/.codex/auth.json`
+
+## 环境变量（可选）
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| MIMO_API_KEY | 上游 API 密钥 | *(必须配置)* |
-| MIMO_BASE_URL | 上游 API 地址 | https://token-plan-cn.xiaomimimo.com/v1 |
 | PROXY_HOST | 代理监听地址 | 127.0.0.1 |
 | PROXY_PORT | 代理监听端口 | 8000 |
 | PROXY_AUTH_TOKEN | 代理访问令牌，未设置则关闭鉴权 | None |
@@ -61,30 +112,31 @@ uvicorn proxy:app --host 127.0.0.1 --port 8000
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | /v1/responses | Responses API 代理入口 (流式/非流式) |
-| GET  | /v1/models | 透传上游模型列表 |
+| POST | /v1/responses | Responses API 代理入口（按 model 自动路由） |
+| GET  | /v1/models | 返回所有已配置的模型列表 |
 | GET  | /health | 健康检查 |
 
-## 与 Codex CLI 集成
+## 关于 "Model metadata not found" 警告
 
-在 Codex CLI 配置中将 base URL 指向本代理:
+Codex CLI 对非内置模型会显示此警告，属于正常现象，不影响功能。可通过在 `config.toml` 中为模型添加详细元数据来消除：
 
-`ash
-export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
-export OPENAI_API_KEY="your-proxy-token-or-dummy"
-codex
-`
+```toml
+[model_providers.proxy.models.mimo-v2.5-pro]
+slug = "mimo-v2.5-pro"
+context_window = 1048576
+supports_parallel_tool_calls = true
+```
 
 ## 项目结构
 
-`
+```
 .
-├── config.py           # 配置项与环境变量读取
-├── proxy.py            # 代理主逻辑 (FastAPI 应用、协议转换、流式处理)
+├── config.py           # 配置加载 (providers.json + 环境变量)
+├── proxy.py            # 代理主逻辑 (FastAPI、协议转换、多 provider 路由)
+├── providers.json      # provider 配置 (不提交 git，含密钥)
 ├── requirements.txt    # Python 依赖
-├── REVIEW.md           # 项目审查报告
 └── README.md           # 本文件
-`
+```
 
 ## 许可
 

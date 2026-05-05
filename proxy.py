@@ -15,9 +15,24 @@ from typing import Any, AsyncGenerator
 import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from config import API_KEY, PROXY_HOST, PROXY_PORT, TARGET_BASE_URL, PROXY_AUTH_TOKEN
+# ── orjson acceleration (fallback to stdlib json) ─────────────────────────────
+try:
+    import orjson as _orjson
+    def _dumps(obj: Any) -> str:
+        return _orjson.dumps(obj).decode()
+    def _loads(s: str) -> Any:
+        return _orjson.loads(s)
+except ImportError:
+    _orjson = None
+    def _dumps(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False)
+    def _loads(s: str) -> Any:
+        return json.loads(s)
+
+from config import PROVIDERS, PROXY_HOST, PROXY_PORT, PROXY_AUTH_TOKEN, ProviderConfig
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -29,8 +44,9 @@ _http_client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     global _http_client
-    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(300, connect=30))
-    log.info("Proxy started: %s → %s", PROXY_HOST + ":" + str(PROXY_PORT), TARGET_BASE_URL)
+    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=300, write=60, pool=10))
+    providers_summary = ", ".join(sorted(set(p.name for p in PROVIDERS.values())))
+    log.info("Proxy started: %s → providers: %s (%d models)", PROXY_HOST + ":" + str(PROXY_PORT), providers_summary, len(PROVIDERS))
     yield
     if _http_client:
         await _http_client.aclose()
@@ -39,14 +55,35 @@ async def lifespan(app):
 
 app = FastAPI(title="Responses→ChatCompletions Proxy", lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 
 @app.middleware("http")
 async def limit_request_body(request: Request, call_next):
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_BODY_SIZE:
-        return JSONResponse(status_code=413, content={"error": {"type": "invalid_request", "message": "Request body too large"}})
+    if content_length:
+        try:
+            if int(content_length) > MAX_BODY_SIZE:
+                return JSONResponse(status_code=413, content={"error": {"type": "invalid_request", "message": "Request body too large"}})
+        except ValueError:
+            return JSONResponse(status_code=400, content={"error": {"type": "invalid_request", "message": "Invalid Content-Length header"}})
     return await call_next(request)
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:8]
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -183,7 +220,7 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                     output = item.get("output", "")
                     if isinstance(output, list):
                         # Some agents send array output
-                        output = json.dumps(output, ensure_ascii=False)
+                        output = _dumps(output)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -218,8 +255,8 @@ def to_chat_completions(data: dict) -> dict:
         result["temperature"] = data["temperature"]
     
     # max_output_tokens → max_tokens
-    if max_tokens := data.get("max_output_tokens"):
-        result["max_tokens"] = max_tokens
+    if "max_output_tokens" in data:
+        result["max_tokens"] = data["max_output_tokens"]
     
     if "top_p" in data:
         result["top_p"] = data["top_p"]
@@ -256,18 +293,22 @@ def _make_id(prefix: str) -> str:
 #  STREAMING — Responses API SSE format
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def stream_response(chat_request: dict, headers: dict, model: str) -> AsyncGenerator[str, None]:
+async def stream_response(chat_request: dict, provider: ProviderConfig, model: str) -> AsyncGenerator[str, None]:
     """
     Stream a Chat Completions response from upstream, convert to Responses API SSE events.
     Full tool call support: captures tool_calls delta chunks and emits them correctly.
     """
+    headers = {
+        "Authorization": f"Bearer {provider.api_key}",
+        "Content-Type": "application/json",
+    }
     resp_id = _make_id("resp")
     msg_id = _make_id("msg")
     reasoning_id = _make_id("rs")
     
     # ── Initial events ──
-    yield f"data: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'in_progress'}})}\n\n"
-    yield f"data: {json.dumps({'type': 'response.in_progress', 'response': {'id': resp_id, 'status': 'in_progress'}})}\n\n"
+    yield f"data: {_dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'in_progress'}})}\n\n"
+    yield f"data: {_dumps({'type': 'response.in_progress', 'response': {'id': resp_id, 'status': 'in_progress'}})}\n\n"
     
     full_reasoning = ""
     full_content = ""
@@ -282,11 +323,12 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
     tool_call_accumulators: dict[int, dict] = {}  # index → {id, name, arguments}
     tool_call_done_emitted: dict[int, bool] = {}
     current_output_index = 0  # tracks the next output_index to use
+    usage_data = None  # captured from the final streaming chunk
     
     try:
         async with _http_client.stream(
             "POST",
-            f"{TARGET_BASE_URL}/chat/completions",
+            f"{provider.base_url}/chat/completions",
             json=chat_request,
             headers=headers,
         ) as resp:
@@ -294,7 +336,7 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                 error_body = await resp.aread()
                 error_msg = error_body.decode(errors="replace")[:500]
                 log.error("Upstream %d: %s", resp.status_code, error_msg)
-                yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': f'Upstream returned {resp.status_code}'}})}\n\n"
+                yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': f'Upstream returned {resp.status_code}'}})}\n\n"
                 return
             
             async for line in resp.aiter_lines():
@@ -305,11 +347,15 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                     break
                 
                 try:
-                    chunk = json.loads(payload)
-                except json.JSONDecodeError:
+                    chunk = _loads(payload)
+                except Exception:
                     log.warning("Malformed chunk: %s", payload[:200])
                     continue
-                
+
+                # Capture usage from the final chunk (stream_options.include_usage)
+                if chunk.get("usage"):
+                    usage_data = chunk["usage"]
+
                 choices = chunk.get("choices", [])
                 if not choices:
                     continue
@@ -322,7 +368,7 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                 if reasoning:
                     if not reasoning_started:
                         reasoning_started = True
-                        yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': []}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': []}})}\n\n"
                     full_reasoning += reasoning
                 
                 # ── Text content ──
@@ -333,15 +379,15 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                         # Close reasoning if it was started
                         if reasoning_started and not reasoning_closed:
                             reasoning_closed = True
-                            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
+                            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
                             current_output_index += 1
 
                         message_emitted = True
-                        yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
                     
                     full_content += content
-                    yield f"data: {json.dumps({'type': 'response.output_text.delta', 'output_index': current_output_index, 'content_index': 0, 'delta': content})}\n\n"
+                    yield f"data: {_dumps({'type': 'response.output_text.delta', 'output_index': current_output_index, 'content_index': 0, 'delta': content})}\n\n"
                 
                 # ── Tool calls (streamed in delta chunks) ──
                 tool_calls = delta.get("tool_calls", [])
@@ -349,22 +395,22 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                     # Close reasoning if it was started and not already closed
                     if reasoning_started and not reasoning_closed:
                         reasoning_closed = True
-                        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
                         current_output_index += 1
 
                     # Close content/message if it was started
                     if content_started:
-                        yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
                         current_output_index += 1
                         content_started = False
                     elif not message_emitted:
                         # Tool calls arrived before any content — emit empty message
                         message_emitted = True
-                        yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-                        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': ''}]}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': ''}]}})}\n\n"
                         current_output_index += 1
                     
                     for tc in tool_calls:
@@ -392,9 +438,9 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
                             tool_calls_started = True
                             tool_calls_output_index = current_output_index
                         
-                        # Emit function_call_call.delta for each chunk
+                        # Emit function_call_arguments.delta for each chunk
                         call_id = acc["id"] or _make_id("call")
-                        yield f"data: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': tool_calls_output_index + tc_index, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': tc_args}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.function_call_arguments.delta', 'item_id': call_id, 'output_index': tool_calls_output_index + tc_index, 'content_index': 0, 'arguments_delta': tc_args})}\n\n"
                 
                 # ── Finish reason handling ──
                 if finish_reason == "tool_calls":
@@ -405,11 +451,11 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
     
     except httpx.TimeoutException:
         log.error("Upstream timeout")
-        yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'timeout', 'message': 'Upstream request timed out'}})}\n\n"
+        yield f"data: {_dumps({'type': 'error', 'error': {'type': 'timeout', 'message': 'Upstream request timed out'}})}\n\n"
         return
     except Exception as e:
         log.error("Stream error: %s", e)
-        yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': 'An error occurred while streaming the response'}})}\n\n"
+        yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': 'An error occurred while streaming the response'}})}\n\n"
         return
     
     # ── Emit final events ──
@@ -417,18 +463,18 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
     # If we had reasoning but no content or tool calls, still need to emit a message
     if not content_started and not message_emitted:
         if reasoning_started and not reasoning_closed:
-            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
             current_output_index += 1
 
         message_emitted = True
-        yield f"data: {json.dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-        yield f"data: {json.dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+        yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
+        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
         full_content = ""
 
     # Close content part if it was opened
     if content_started:
-        yield f"data: {json.dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
-        yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
+        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
+        yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
     
     # Close tool call items
     for tc_index in sorted(tool_call_accumulators.keys()):
@@ -436,7 +482,7 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
             acc = tool_call_accumulators[tc_index]
             call_id = acc["id"] or _make_id("call")
             idx = (tool_calls_output_index or current_output_index) + tc_index
-            yield f"data: {json.dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': acc['arguments']}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': acc['arguments']}})}\n\n"
             tool_call_done_emitted[tc_index] = True
     
     # ── Final response.completed event ──
@@ -464,7 +510,12 @@ async def stream_response(chat_request: dict, headers: dict, model: str) -> Asyn
             "arguments": acc["arguments"],
         })
     
-    yield f"data: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'completed', 'output': output}})}\n\n"
+    resp_usage = {
+        "input_tokens": usage_data.get("prompt_tokens", 0) if usage_data else 0,
+        "output_tokens": usage_data.get("completion_tokens", 0) if usage_data else 0,
+        "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
+    }
+    yield f"data: {_dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'completed', 'output': output, 'usage': resp_usage}})}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -535,57 +586,68 @@ def to_responses_format(chat_response: dict, model: str) -> dict:
 
 @app.post("/v1/responses")
 async def proxy_responses(request: Request):
-    """Main proxy endpoint: Responses API → Chat Completions → MiMo → Responses API."""
+    """Main proxy endpoint: Responses API → Chat Completions → upstream → Responses API."""
     # Optional auth check
     if PROXY_AUTH_TOKEN:
         auth_header = request.headers.get("authorization", "")
         if not hmac.compare_digest(auth_header, f"Bearer {PROXY_AUTH_TOKEN}"):
             return JSONResponse(status_code=401, content={"error": {"type": "auth_error", "message": "Invalid proxy token"}})
-    
+
     try:
         data = await request.json()
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"type": "invalid_request", "message": "Invalid JSON body"}})
-    
+
     model = data.get("model", "")
     is_stream = data.get("stream", False)
-    
-    log.info("Request: model=%s, stream=%s", model, is_stream)
-    
+
+    # ── 路由：按 model 查找 provider ──
+    provider = PROVIDERS.get(model)
+    if not provider:
+        available = ", ".join(sorted(PROVIDERS.keys()))
+        return JSONResponse(status_code=400, content={
+            "error": {
+                "type": "invalid_request",
+                "message": f"Unknown model '{model}'. Available models: {available}",
+            }
+        })
+
+    request_id = getattr(request.state, "request_id", "?")
+    log.info("[%s] Request: model=%s, provider=%s, stream=%s", request_id, model, provider.name, is_stream)
+
     # Convert to Chat Completions format
     chat_request = to_chat_completions(data)
     chat_request["stream"] = is_stream
-    
+
     # Request usage stats in streaming
     if is_stream:
         chat_request["stream_options"] = {"include_usage": True}
-    
+
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {provider.api_key}",
         "Content-Type": "application/json",
     }
-    
+
     try:
         if is_stream:
             return StreamingResponse(
-                stream_response(chat_request, headers, model),
+                stream_response(chat_request, provider, model),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        
+
         # Non-streaming
         resp = await _http_client.post(
-            f"{TARGET_BASE_URL}/chat/completions",
+            f"{provider.base_url}/chat/completions",
             json=chat_request,
             headers=headers,
         )
-        
+
         if "application/json" not in resp.headers.get("content-type", ""):
             log.error("Upstream returned non-JSON (status %d, content-type: %s)", resp.status_code, resp.headers.get("content-type"))
             return JSONResponse(status_code=502, content={"error": {"type": "upstream_error", "message": "Upstream returned unexpected response format"}})
         chat_response = resp.json()
         if resp.status_code != 200:
-            # Forward error in Responses API format
             error_msg = chat_response.get("error", {}).get("message", str(chat_response))
             return JSONResponse(
                 status_code=resp.status_code,
@@ -597,10 +659,10 @@ async def proxy_responses(request: Request):
                     }
                 }
             )
-        
+
         result = to_responses_format(chat_response, model)
         return result
-    
+
     except httpx.TimeoutException:
         return JSONResponse(status_code=504, content={"error": {"type": "timeout", "message": "Upstream request timed out"}})
     except Exception as e:
@@ -610,17 +672,18 @@ async def proxy_responses(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
-    """Proxy the models list endpoint."""
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-    try:
-        resp = await _http_client.get(f"{TARGET_BASE_URL}/models", headers=headers)
-        if "application/json" not in resp.headers.get("content-type", ""):
-            log.error("Models endpoint returned non-JSON (status %d, content-type: %s)", resp.status_code, resp.headers.get("content-type"))
-            return JSONResponse(status_code=502, content={"error": {"type": "upstream_error", "message": "Upstream returned unexpected response format"}})
-        return resp.json()
-    except Exception as e:
-        log.error("Models endpoint error: %s", e)
-        return JSONResponse(status_code=502, content={"error": {"type": "upstream_error", "message": "Could not fetch models"}})
+    """Return aggregated model list from all configured providers."""
+    models = []
+    seen = set()
+    for model_name, provider in PROVIDERS.items():
+        if model_name not in seen:
+            seen.add(model_name)
+            models.append({
+                "id": model_name,
+                "object": "model",
+                "owned_by": provider.name,
+            })
+    return {"object": "list", "data": models}
 
 
 @app.get("/health")
@@ -631,5 +694,5 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     print(f"Starting proxy server on http://{PROXY_HOST}:{PROXY_PORT}")
-    print(f"Forwarding to {TARGET_BASE_URL}")
+    print(f"Models: {', '.join(sorted(PROVIDERS.keys()))}")
     uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT)
