@@ -27,11 +27,11 @@ Codex CLI              Proxy (FastAPI)              Upstream Providers
 - 启动时 provider 连通性预检
 - 请求体大小限制（10MB）、CORS、请求 ID
 - **Web 配置管理界面**（浏览器可视化配置 Provider，无需手动编辑 JSON）
+- **配置热重载**（通过 Web UI 修改后无需重启进程）
 
 ## 环境要求
 
 - Python 3.10+
-- Codex CLI
 
 ## 快速开始
 
@@ -41,31 +41,35 @@ Codex CLI              Proxy (FastAPI)              Upstream Providers
 pip install -r requirements.txt
 ```
 
-### 2. 配置 providers.json
+### 2. 初始化配置
 
-```json
-{
-  "providers": {
-    "mimo": {
-      "base_url": "https://your-mimo-api/v1",
-      "api_key": "your-mimo-key",
-      "models": ["mimo-v2.5-pro", "mimo-v2.5"]
-    },
-    "deepseek": {
-      "base_url": "https://api.deepseek.com/v1",
-      "api_key": "your-deepseek-key",
-      "models": ["deepseek-v4-pro", "deepseek-v4-flash"]
-    },
-    "qwen": {
-      "base_url": "https://coding.dashscope.aliyuncs.com/v1",
-      "api_key": "your-qwen-key",
-      "models": ["qwen3.6-plus", "glm-5", "kimi-k2.5"]
-    }
-  }
-}
+首次使用请复制示例配置并填入自己的 API Key：
+
+```bash
+cp providers.json.example providers.json
 ```
 
-### 3. 配置 Codex CLI
+然后编辑 `providers.json`，将 `api_key` 替换为你的实际密钥。
+
+> 💡 也可以直接启动代理，通过 Web 界面完成配置（见下方说明）。
+
+### 3. 启动代理
+
+```bash
+python proxy.py
+```
+
+启动后终端会显示：
+
+```
+INFO:     Uvicorn running on http://127.0.0.1:8000
+```
+
+### 4. 打开 Web 配置管理界面
+
+浏览器访问 **http://127.0.0.1:8000** 即可打开配置管理面板。
+
+### 5. 配置 Codex CLI
 
 编辑 `~/.codex/config.toml`（Windows: `%USERPROFILE%\.codex\config.toml`）：
 
@@ -87,13 +91,7 @@ requires_openai_auth = false
 }
 ```
 
-### 4. 启动代理
-
-```bash
-python proxy.py
-```
-
-### 5. 使用 Codex
+### 6. 使用 Codex
 
 ```bash
 codex
@@ -101,18 +99,54 @@ codex
 
 切换模型：修改 `config.toml` 中的 `model` 字段，重启 Codex。
 
+---
+
 ## Web 配置管理界面
 
-启动代理后，浏览器访问 **http://127.0.0.1:8000** 即可打开配置管理面板。
+启动代理后，浏览器访问 **http://127.0.0.1:8000** 打开深色主题的配置管理面板。
 
-功能：
-- 可视化管理 Provider（添加 / 删除 / 编辑）
-- API Key 掩码显示，点击即可修改
-- 模型列表标签化管理（回车添加、点击 × 删除）
-- 一键连通性测试（ping 上游 `/v1/models`）
-- 保存后自动热重载，无需重启进程
+### 界面功能
+
+| 功能 | 操作方式 |
+|------|----------|
+| 添加 Provider | 点击底部「+ 添加 Provider」卡片 |
+| 编辑 Provider | 直接修改卡片中的字段 |
+| 删除 Provider | 点击卡片右上角「删除」按钮 |
+| 管理模型列表 | 输入框输入模型名后按回车添加，点击 × 删除 |
+| 查看 API Key | 点击眼睛图标切换明文/掩码显示 |
+| 修改 API Key | 点击输入框直接编辑，保存后生效 |
+| 测试连通性 | 点击「测试」按钮，自动 ping 上游 `/v1/models` |
+| 保存配置 | 点击右上角「保存配置」，自动热重载无需重启 |
+
+### 全局设置
+
+顶部工具栏可配置：
+- **Host** — 代理监听地址（默认 127.0.0.1）
+- **Port** — 代理监听端口（默认 8000）
+
+### 工作流程
+
+```
+浏览器打开 http://127.0.0.1:8000
+        |
+        v
+  查看/编辑 Provider 配置
+        |
+        v
+  点击「测试」验证连通性
+        |
+        v
+  点击「保存配置」→ 自动热重载
+        |
+        v
+  代理立即生效，无需重启
+```
+
+---
 
 ## providers.json 说明
+
+### 字段说明
 
 | 字段 | 说明 |
 |------|------|
@@ -120,7 +154,21 @@ codex
 | `api_key` | 上游 API 密钥（可选，缺省从 ~/.codex/auth.json 读取） |
 | `models` | 该 provider 支持的模型列表（必须） |
 
-`api_key` 优先级：providers.json 中的值 > 环境变量 `MIMO_API_KEY` > `~/.codex/auth.json`
+### API Key 优先级
+
+providers.json 中的值 > 环境变量 > ~/.codex/auth.json
+
+### 示例
+
+参考 `providers.json.example`，支持的 provider：
+
+| Provider | Base URL | 模型 |
+|----------|----------|------|
+| MiMo | https://token-plan-cn.xiaomimimo.com/v1 | mimo-v2.5-pro, mimo-v2.5 |
+| DeepSeek | https://api.deepseek.com/v1 | deepseek-v4-pro, deepseek-v4-flash |
+| Qwen | https://coding.dashscope.aliyuncs.com/v1 | qwen3.6-plus, glm-5, kimi-k2.5 |
+
+---
 
 ## 环境变量（可选）
 
@@ -158,14 +206,15 @@ supports_parallel_tool_calls = true
 
 ```
 .
-├── config.py           # 配置加载 (providers.json + 环境变量)
-├── config_store.py     # 配置持久化 (providers.json 读写)
-├── proxy.py            # 代理主逻辑 (FastAPI、协议转换、多 provider 路由)
+├── proxy.py              # 代理主逻辑 (FastAPI、协议转换、多 provider 路由)
+├── config.py             # 配置加载 (providers.json + 环境变量)
+├── config_store.py       # 配置持久化 (providers.json 读写)
 ├── static/
-│   └── index.html      # Web 配置管理界面
-├── providers.json      # provider 配置 (不提交 git，含密钥)
-├── requirements.txt    # Python 依赖
-└── README.md           # 本文件
+│   └── index.html        # Web 配置管理界面
+├── providers.json.example  # 配置示例文件（需复制为 providers.json 并填入密钥）
+├── providers.json        # 实际配置 (不提交 git，含密钥)
+├── requirements.txt      # Python 依赖
+└── README.md             # 本文件
 ```
 
 ## 许可
