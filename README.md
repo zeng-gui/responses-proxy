@@ -53,12 +53,12 @@ pip install -r requirements.txt
     "deepseek": {
       "base_url": "https://api.deepseek.com/v1",
       "api_key": "your-deepseek-key",
-      "models": ["deepseek-chat", "deepseek-reasoner"]
+      "models": ["deepseek-v4-pro", "deepseek-v4-flash"]
     },
     "qwen": {
       "base_url": "https://coding.dashscope.aliyuncs.com/v1",
       "api_key": "your-qwen-key",
-      "models": ["qwen3.6-plus", "qwen-max"]
+      "models": ["qwen3.6-plus", "glm-5", "kimi-k2.5"]
     }
   }
 }
