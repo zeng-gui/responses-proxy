@@ -17,6 +17,16 @@ Codex CLI              Proxy (FastAPI)              Upstream Providers
 
 代理根据请求中的 `model` 字段自动路由到对应的上游 provider。
 
+## 特性
+
+- 多 Provider 路由（providers.json 配置）
+- 流式 / 非流式响应
+- 完整 tool call 生命周期（合并连续 function_call）
+- 多模态输入（input_image → image_url）
+- reasoning_content 自动注入（DeepSeek 兼容）
+- 启动时 provider 连通性预检
+- 请求体大小限制（10MB）、CORS、请求 ID
+
 ## 环境要求
 
 - Python 3.10+
@@ -46,7 +56,7 @@ pip install -r requirements.txt
       "models": ["deepseek-chat", "deepseek-reasoner"]
     },
     "qwen": {
-      "base_url": "https://your-qwen-api/v1",
+      "base_url": "https://coding.dashscope.aliyuncs.com/v1",
       "api_key": "your-qwen-key",
       "models": ["qwen3.6-plus", "qwen-max"]
     }
@@ -94,7 +104,7 @@ codex
 
 | 字段 | 说明 |
 |------|------|
-| `base_url` | 上游 API 地址（必须） |
+| `base_url` | 上游 API 地址（必须，需含 `/v1`） |
 | `api_key` | 上游 API 密钥（可选，缺省从 ~/.codex/auth.json 读取） |
 | `models` | 该 provider 支持的模型列表（必须） |
 

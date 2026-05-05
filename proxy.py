@@ -47,6 +47,17 @@ async def lifespan(app):
     _http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=300, write=60, pool=10))
     providers_summary = ", ".join(sorted(set(p.name for p in PROVIDERS.values())))
     log.info("Proxy started: %s → providers: %s (%d models)", PROXY_HOST + ":" + str(PROXY_PORT), providers_summary, len(PROVIDERS))
+    # Startup connectivity pre-check
+    checked = set()
+    for p in PROVIDERS.values():
+        if p.base_url in checked:
+            continue
+        checked.add(p.base_url)
+        try:
+            r = await _http_client.get(f"{p.base_url}/models", timeout=5)
+            log.info("  ✓ %s (%s) → %d", p.name, p.base_url, r.status_code)
+        except Exception as e:
+            log.warning("  ✗ %s (%s) → %s", p.name, p.base_url, e)
     yield
     if _http_client:
         await _http_client.aclose()
@@ -139,6 +150,26 @@ def _convert_responses_tool_choice_to_chat(tool_choice) -> dict | None:
     return "auto"
 
 
+def _convert_content_parts(content_list: list) -> str | list:
+    """Convert Responses API content array to Chat Completions content format.
+    Returns a plain string if only text parts, otherwise returns a multimodal array."""
+    parts = []
+    for c in content_list:
+        if not isinstance(c, dict):
+            continue
+        ptype = c.get("type", "")
+        if ptype in ("input_text", "text"):
+            parts.append({"type": "text", "text": c.get("text", "")})
+        elif ptype == "input_image":
+            parts.append({"type": "image_url", "image_url": {"url": c.get("image_url", "")}})
+        else:
+            # Fallback: try to extract text or stringify
+            parts.append({"type": "text", "text": c.get("text", str(c))})
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return parts[0]["text"]
+    return parts or ""
+
+
 def convert_input_to_messages(data: dict) -> list[dict]:
     """
     Convert Responses API input format to Chat Completions messages.
@@ -184,35 +215,37 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                         actual_role = "system"
                     
                     if isinstance(content, list):
-                        # Flatten array content
-                        text_parts = []
-                        for c in content:
-                            if isinstance(c, dict):
-                                if c.get("type") == "input_text":
-                                    text_parts.append(c.get("text", ""))
-                                elif c.get("type") == "text":
-                                    text_parts.append(c.get("text", ""))
-                        content = "".join(text_parts)
-                    
-                    messages.append({"role": actual_role, "content": content})
+                        content = _convert_content_parts(content)
+
+                    msg = {"role": actual_role, "content": content}
+                    if actual_role == "assistant":
+                        msg["reasoning_content"] = ""
+                    messages.append(msg)
                 
                 # ── Function call item (assistant decided to call a tool) ──
                 elif item_type == "function_call":
                     call_id = item.get("call_id", "")
                     func_name = item.get("name", "")
                     arguments = item.get("arguments", "{}")
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": func_name,
-                                "arguments": arguments,
-                            }
-                        }]
-                    })
+                    tc = {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": func_name,
+                            "arguments": arguments,
+                        }
+                    }
+                    # Merge consecutive function_calls into one assistant message
+                    if (messages and messages[-1].get("role") == "assistant"
+                            and "tool_calls" in messages[-1]):
+                        messages[-1]["tool_calls"].append(tc)
+                    else:
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "",
+                            "tool_calls": [tc],
+                        })
                 
                 # ── Function call output (tool result) ──
                 elif item_type == "function_call_output":
@@ -232,9 +265,11 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                     if role:
                         content = item.get("content", "")
                         if isinstance(content, list):
-                            text_parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
-                            content = "".join(text_parts)
-                        messages.append({"role": role, "content": content if content else ""})
+                            content = _convert_content_parts(content)
+                        msg = {"role": role, "content": content if content else ""}
+                        if role == "assistant":
+                            msg["reasoning_content"] = ""
+                        messages.append(msg)
             
             i += 1
     
