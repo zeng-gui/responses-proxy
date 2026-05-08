@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 import logging
+import asyncio
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -339,7 +340,7 @@ def _make_id(prefix: str) -> str:
 #  STREAMING — Responses API SSE format
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def stream_response(chat_request: dict, provider: ProviderConfig, model: str) -> AsyncGenerator[str, None]:
+async def stream_response(chat_request: dict, provider: ProviderConfig, model: str, request: Request | None = None) -> AsyncGenerator[str, None]:
     """
     Stream a Chat Completions response from upstream, convert to Responses API SSE events.
     Full tool call support: captures tool_calls delta chunks and emits them correctly.
@@ -385,7 +386,22 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
                 yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': f'Upstream returned {resp.status_code}'}})}\n\n"
                 return
             
-            async for line in resp.aiter_lines():
+            line_iter = resp.aiter_lines()
+            while True:
+                # Client disconnect detection
+                if request and await request.is_disconnected():
+                    log.info("Client disconnected, stopping upstream stream (model=%s, provider=%s)", model, provider.name)
+                    return
+
+                try:
+                    line = await asyncio.wait_for(line_iter.__anext__(), timeout=30)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    # Upstream idle for 30s, send SSE comment as heartbeat
+                    yield ": heartbeat\n\n"
+                    continue
+
                 if not line.startswith("data: "):
                     continue
                 payload = line[6:]
@@ -889,7 +905,7 @@ async def proxy_responses(request: Request):
     try:
         if is_stream:
             return StreamingResponse(
-                stream_response(chat_request, provider, model),
+                stream_response(chat_request, provider, model, request),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
