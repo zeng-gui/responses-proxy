@@ -99,13 +99,22 @@ def _write_model_to_file(config_file: Path, model: str) -> None:
         )
         if n == 0:
             new_text = f'model = "{model}"\n' + text
-        # 确保模型元数据段存在
+        # 确保模型元数据段存在（完整字段，Codex CLI 需要）
         meta_section = f'[model_providers.proxy.models.{model}]'
         if meta_section not in new_text:
             new_text = new_text.rstrip('\n') + f'\n\n{meta_section}\n'
             new_text += f'slug = "{model}"\n'
+            new_text += f'display_name = "{model}"\n'
+            new_text += f'description = "{model} model via proxy"\n'
+            new_text += 'default_reasoning_level = "high"\n'
+            new_text += 'supported_reasoning_levels = ["low", "medium", "high", "xhigh"]\n'
+            new_text += 'shell_type = "shell_command"\n'
+            new_text += 'apply_patch_tool_type = "freeform"\n'
             new_text += 'context_window = 1048576\n'
+            new_text += 'max_context_window = 1048576\n'
+            new_text += 'effective_context_window_percent = 95\n'
             new_text += 'supports_parallel_tool_calls = true\n'
+            new_text += 'supports_search_tool = false\n'
         config_file.write_text(new_text, encoding="utf-8")
         _log.info("%s model 已更新为: %s", config_file, model)
     except OSError as e:

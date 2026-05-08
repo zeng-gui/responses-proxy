@@ -48,7 +48,7 @@ _http_client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(app):
     global _http_client
-    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=300, write=60, pool=10))
+    _http_client = httpx.AsyncClient(timeout=httpx.Timeout(connect=30, read=600, write=60, pool=10))
     providers_summary = ", ".join(sorted(set(p.name for p in PROVIDERS.values())))
     log.info("Proxy started: %s → providers: %s (%d models)", PROXY_HOST + ":" + str(PROXY_PORT), providers_summary, len(PROVIDERS))
     # Startup connectivity pre-check
@@ -58,7 +58,11 @@ async def lifespan(app):
             continue
         checked.add(p.base_url)
         try:
-            r = await _http_client.get(f"{p.base_url}/models", timeout=5)
+            r = await _http_client.get(
+                f"{p.base_url}/models",
+                headers={"Authorization": f"Bearer {p.api_key}"},
+                timeout=5,
+            )
             log.info("  ✓ %s (%s) → %d", p.name, p.base_url, r.status_code)
         except Exception as e:
             log.warning("  ✗ %s (%s) → %s", p.name, p.base_url, e)
@@ -226,8 +230,8 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                         content = _convert_content_parts(content)
 
                     msg = {"role": actual_role, "content": content}
-                    if actual_role == "assistant":
-                        msg["reasoning_content"] = ""
+                    if actual_role == "assistant" and item.get("reasoning_content"):
+                        msg["reasoning_content"] = item["reasoning_content"]
                     messages.append(msg)
                 
                 # ── Function call item (assistant decided to call a tool) ──
@@ -251,7 +255,6 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                         messages.append({
                             "role": "assistant",
                             "content": None,
-                            "reasoning_content": "",
                             "tool_calls": [tc],
                         })
                 
@@ -275,8 +278,8 @@ def convert_input_to_messages(data: dict) -> list[dict]:
                         if isinstance(content, list):
                             content = _convert_content_parts(content)
                         msg = {"role": role, "content": content if content else ""}
-                        if role == "assistant":
-                            msg["reasoning_content"] = ""
+                        if role == "assistant" and item.get("reasoning_content"):
+                            msg["reasoning_content"] = item["reasoning_content"]
                         messages.append(msg)
             
             i += 1
@@ -378,7 +381,7 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
             if resp.status_code != 200:
                 error_body = await resp.aread()
                 error_msg = error_body.decode(errors="replace")[:500]
-                log.error("Upstream %d: %s", resp.status_code, error_msg)
+                log.error("Upstream stream %d (model=%s, provider=%s): %s", resp.status_code, model, provider.name, error_msg)
                 yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': f'Upstream returned {resp.status_code}'}})}\n\n"
                 return
             
@@ -493,12 +496,12 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
                     pass  # Will be handled after stream ends
     
     except httpx.TimeoutException:
-        log.error("Upstream timeout")
+        log.error("Upstream timeout for model=%s provider=%s", model, provider.name)
         yield f"data: {_dumps({'type': 'error', 'error': {'type': 'timeout', 'message': 'Upstream request timed out'}})}\n\n"
         return
     except Exception as e:
-        log.error("Stream error: %s", e)
-        yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': 'An error occurred while streaming the response'}})}\n\n"
+        log.error("Stream error (model=%s, provider=%s): %s", model, provider.name, e, exc_info=True)
+        yield f"data: {_dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': f'Stream error: {e}'}})}\n\n"
         return
     
     # ── Emit final events ──
@@ -865,7 +868,10 @@ async def proxy_responses(request: Request):
         })
 
     request_id = getattr(request.state, "request_id", "?")
-    log.info("[%s] Request: model=%s, provider=%s, stream=%s", request_id, model, provider.name, is_stream)
+    input_data = data.get("input", "")
+    input_len = len(input_data) if isinstance(input_data, (str, list)) else 0
+    tool_count = len(data.get("tools", []))
+    log.info("[%s] Request: model=%s, provider=%s, stream=%s, input_len=%d, tools=%d", request_id, model, provider.name, is_stream, input_len, tool_count)
 
     # Convert to Chat Completions format
     chat_request = to_chat_completions(data)
@@ -896,11 +902,13 @@ async def proxy_responses(request: Request):
         )
 
         if "application/json" not in resp.headers.get("content-type", ""):
-            log.error("Upstream returned non-JSON (status %d, content-type: %s)", resp.status_code, resp.headers.get("content-type"))
-            return JSONResponse(status_code=502, content={"error": {"type": "upstream_error", "message": "Upstream returned unexpected response format"}})
+            error_body = (await resp.aread()).decode(errors="replace")[:500]
+            log.error("Upstream non-JSON (status %d, content-type: %s): %s", resp.status_code, resp.headers.get("content-type"), error_body)
+            return JSONResponse(status_code=502, content={"error": {"type": "upstream_error", "message": f"Upstream returned non-JSON: {error_body[:200]}"}})
         chat_response = resp.json()
         if resp.status_code != 200:
             error_msg = chat_response.get("error", {}).get("message", str(chat_response))
+            log.error("Upstream error %d (model=%s, provider=%s): %s", resp.status_code, model, provider.name, error_msg[:500])
             return JSONResponse(
                 status_code=resp.status_code,
                 content={
