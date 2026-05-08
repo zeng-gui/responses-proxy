@@ -511,6 +511,9 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
                 elif finish_reason in ("stop", "length", None):
                     pass  # Will be handled after stream ends
     
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        log.info("Client connection reset during stream (model=%s, provider=%s)", model, provider.name)
+        return
     except httpx.TimeoutException:
         log.error("Upstream timeout for model=%s provider=%s", model, provider.name)
         yield f"data: {_dumps({'type': 'error', 'error': {'type': 'timeout', 'message': 'Upstream request timed out'}})}\n\n"
@@ -521,64 +524,67 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
         return
     
     # ── Emit final events ──
+    try:
+        # If we had reasoning but no content or tool calls, still need to emit a message
+        if not content_started and not message_emitted:
+            if reasoning_started and not reasoning_closed:
+                yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
+                current_output_index += 1
 
-    # If we had reasoning but no content or tool calls, still need to emit a message
-    if not content_started and not message_emitted:
-        if reasoning_started and not reasoning_closed:
-            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'reasoning', 'id': reasoning_id, 'summary': [{'type': 'summary_text', 'text': full_reasoning[:500]}]}})}\n\n"
-            current_output_index += 1
+            message_emitted = True
+            yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+            full_content = ""
 
-        message_emitted = True
-        yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-        full_content = ""
+        # Close content part if it was opened
+        if content_started:
+            yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
 
-    # Close content part if it was opened
-    if content_started:
-        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
-        yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
-    
-    # Close tool call items
-    for tc_index in sorted(tool_call_accumulators.keys()):
-        if not tool_call_done_emitted.get(tc_index, False):
+        # Close tool call items
+        for tc_index in sorted(tool_call_accumulators.keys()):
+            if not tool_call_done_emitted.get(tc_index, False):
+                acc = tool_call_accumulators[tc_index]
+                call_id = acc["id"] or _make_id("call")
+                idx = (tool_calls_output_index or current_output_index) + tc_index
+                yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': acc['arguments']}})}\n\n"
+                tool_call_done_emitted[tc_index] = True
+
+        # ── Final response.completed event ──
+        output = []
+
+        # Add content message if we have text
+        if message_emitted and full_content:
+            output.append({
+                "type": "message",
+                "id": msg_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": full_content}],
+            })
+
+        # Add function call items
+        for tc_index in sorted(tool_call_accumulators.keys()):
             acc = tool_call_accumulators[tc_index]
             call_id = acc["id"] or _make_id("call")
-            idx = (tool_calls_output_index or current_output_index) + tc_index
-            yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': acc['arguments']}})}\n\n"
-            tool_call_done_emitted[tc_index] = True
-    
-    # ── Final response.completed event ──
-    output = []
-    
-    # Add content message if we have text
-    if message_emitted and full_content:
-        output.append({
-            "type": "message",
-            "id": msg_id,
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": full_content}],
-        })
-    
-    # Add function call items
-    for tc_index in sorted(tool_call_accumulators.keys()):
-        acc = tool_call_accumulators[tc_index]
-        call_id = acc["id"] or _make_id("call")
-        output.append({
-            "type": "function_call",
-            "id": call_id,
-            "call_id": call_id,
-            "name": acc["name"],
-            "arguments": acc["arguments"],
-        })
-    
-    resp_usage = {
-        "input_tokens": usage_data.get("prompt_tokens", 0) if usage_data else 0,
-        "output_tokens": usage_data.get("completion_tokens", 0) if usage_data else 0,
-        "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
-    }
-    yield f"data: {_dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'completed', 'output': output, 'usage': resp_usage}})}\n\n"
-    yield "data: [DONE]\n\n"
+            output.append({
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": acc["name"],
+                "arguments": acc["arguments"],
+            })
+
+        resp_usage = {
+            "input_tokens": usage_data.get("prompt_tokens", 0) if usage_data else 0,
+            "output_tokens": usage_data.get("completion_tokens", 0) if usage_data else 0,
+            "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
+        }
+        yield f"data: {_dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'completed', 'output': output, 'usage': resp_usage}})}\n\n"
+        yield "data: [DONE]\n\n"
+    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+        log.info("Client disconnected before final events (model=%s, provider=%s)", model, provider.name)
+        return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
