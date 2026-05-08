@@ -288,10 +288,20 @@ def convert_input_to_messages(data: dict) -> list[dict]:
     return messages
 
 
+_AGENT_SYSTEM_PROMPT = (
+    "You are an autonomous agent. Continue using tools until the task is fully complete. "
+    "Do not stop mid-task. If you need to read files, run commands, or make changes, "
+    "do so proactively without asking for permission."
+)
+
 def to_chat_completions(data: dict) -> dict:
     """Convert a Responses API request to a Chat Completions request."""
     messages = convert_input_to_messages(data)
-    
+
+    # 当有工具时，注入 agent 指令防止模型提前停止
+    if data.get("tools"):
+        messages.insert(0, {"role": "system", "content": _AGENT_SYSTEM_PROMPT})
+
     result = {
         "model": data.get("model", ""),
         "messages": messages,
@@ -446,10 +456,10 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
 
                         message_emitted = True
                         yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-                        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-                    
+                        yield f"data: {_dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+
                     full_content += content
-                    yield f"data: {_dumps({'type': 'response.output_text.delta', 'output_index': current_output_index, 'content_index': 0, 'delta': content})}\n\n"
+                    yield f"data: {_dumps({'type': 'response.output_text.delta', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'delta': content})}\n\n"
                 
                 # ── Tool calls (streamed in delta chunks) ──
                 tool_calls = delta.get("tool_calls", [])
@@ -462,7 +472,8 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
 
                     # Close content/message if it was started
                     if content_started:
-                        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'text': full_content})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
                         yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
                         current_output_index += 1
                         content_started = False
@@ -470,8 +481,9 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
                         # Tool calls arrived before any content — emit empty message
                         message_emitted = True
                         yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-                        yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-                        yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'text': ''})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.content_part.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
                         yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': ''}]}})}\n\n"
                         current_output_index += 1
                     
@@ -502,7 +514,7 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
                         
                         # Emit function_call_arguments.delta for each chunk
                         call_id = acc["id"] or _make_id("call")
-                        yield f"data: {_dumps({'type': 'response.function_call_arguments.delta', 'item_id': call_id, 'output_index': tool_calls_output_index + tc_index, 'content_index': 0, 'arguments_delta': tc_args})}\n\n"
+                        yield f"data: {_dumps({'type': 'response.function_call_arguments.delta', 'item_id': call_id, 'output_index': tool_calls_output_index + tc_index, 'delta': tc_args})}\n\n"
                 
                 # ── Finish reason handling ──
                 if finish_reason == "tool_calls":
@@ -524,6 +536,9 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
         return
     
     # ── Emit final events ──
+    if finish_reason:
+        log.info("Stream finished: model=%s, provider=%s, finish_reason=%s, content_len=%d, reasoning_len=%d, tool_calls=%d",
+                 model, provider.name, finish_reason, len(full_content), len(full_reasoning), len(tool_call_accumulators))
     try:
         # If we had reasoning but no content or tool calls, still need to emit a message
         if not content_started and not message_emitted:
@@ -533,20 +548,22 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
 
             message_emitted = True
             yield f"data: {_dumps({'type': 'response.output_item.added', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'in_progress', 'content': []}})}\n\n"
-            yield f"data: {_dumps({'type': 'response.content_part.added', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.content_part.added', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
             full_content = ""
 
         # Close content part if it was opened
         if content_started:
-            yield f"data: {_dumps({'type': 'response.content_part.done', 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
+            yield f"data: {_dumps({'type': 'response.output_text.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'text': full_content})}\n\n"
+            yield f"data: {_dumps({'type': 'response.content_part.done', 'item_id': msg_id, 'output_index': current_output_index, 'content_index': 0, 'part': {'type': 'output_text', 'text': full_content}})}\n\n"
             yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': current_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': full_content}]}})}\n\n"
 
-        # Close tool call items
+        # Close tool call items with function_call_arguments.done
         for tc_index in sorted(tool_call_accumulators.keys()):
             if not tool_call_done_emitted.get(tc_index, False):
                 acc = tool_call_accumulators[tc_index]
                 call_id = acc["id"] or _make_id("call")
                 idx = (tool_calls_output_index or current_output_index) + tc_index
+                yield f"data: {_dumps({'type': 'response.function_call_arguments.done', 'item_id': call_id, 'output_index': idx, 'arguments': acc['arguments']})}\n\n"
                 yield f"data: {_dumps({'type': 'response.output_item.done', 'output_index': idx, 'item': {'type': 'function_call', 'id': call_id, 'call_id': call_id, 'name': acc['name'], 'arguments': acc['arguments']}})}\n\n"
                 tool_call_done_emitted[tc_index] = True
 
@@ -579,8 +596,22 @@ async def stream_response(chat_request: dict, provider: ProviderConfig, model: s
             "input_tokens": usage_data.get("prompt_tokens", 0) if usage_data else 0,
             "output_tokens": usage_data.get("completion_tokens", 0) if usage_data else 0,
             "total_tokens": usage_data.get("total_tokens", 0) if usage_data else 0,
+            "output_tokens_details": {
+                "reasoning_tokens": usage_data.get("completion_tokens_details", {}).get("reasoning_tokens", 0) if usage_data else 0,
+            },
         }
-        yield f"data: {_dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'model': model, 'status': 'completed', 'output': output, 'usage': resp_usage}})}\n\n"
+        resp_status = "completed"
+        incomplete_details = None
+        if finish_reason == "length":
+            resp_status = "incomplete"
+            incomplete_details = {"reason": "max_output_tokens"}
+        resp_obj = {
+            "id": resp_id, "object": "response", "model": model,
+            "status": resp_status, "output": output, "usage": resp_usage,
+        }
+        if incomplete_details:
+            resp_obj["incomplete_details"] = incomplete_details
+        yield f"data: {_dumps({'type': 'response.completed', 'response': resp_obj})}\n\n"
         yield "data: [DONE]\n\n"
     except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
         log.info("Client disconnected before final events (model=%s, provider=%s)", model, provider.name)
@@ -633,7 +664,8 @@ def to_responses_format(chat_response: dict, model: str) -> dict:
             })
     
     usage = chat_response.get("usage", {})
-    return {
+    finish_reason = chat_response.get("choices", [{}])[0].get("finish_reason", "")
+    result = {
         "id": resp_id,
         "object": "response",
         "created_at": int(time.time()),
@@ -643,9 +675,16 @@ def to_responses_format(chat_response: dict, model: str) -> dict:
             "input_tokens": usage.get("prompt_tokens", 0),
             "output_tokens": usage.get("completion_tokens", 0),
             "total_tokens": usage.get("total_tokens", 0),
+            "output_tokens_details": {
+                "reasoning_tokens": usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0),
+            },
         },
         "status": "completed",
     }
+    if finish_reason == "length":
+        result["status"] = "incomplete"
+        result["incomplete_details"] = {"reason": "max_output_tokens"}
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -893,7 +932,8 @@ async def proxy_responses(request: Request):
     input_data = data.get("input", "")
     input_len = len(input_data) if isinstance(input_data, (str, list)) else 0
     tool_count = len(data.get("tools", []))
-    log.info("[%s] Request: model=%s, provider=%s, stream=%s, input_len=%d, tools=%d", request_id, model, provider.name, is_stream, input_len, tool_count)
+    max_tokens = data.get("max_output_tokens")
+    log.info("[%s] Request: model=%s, provider=%s, stream=%s, input_len=%d, tools=%d, max_output_tokens=%s", request_id, model, provider.name, is_stream, input_len, tool_count, max_tokens)
 
     # Convert to Chat Completions format
     chat_request = to_chat_completions(data)
